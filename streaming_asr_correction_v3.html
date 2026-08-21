@@ -1,0 +1,450 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Streaming ASR Correction Prototype v3</title>
+<style>
+:root{
+  color-scheme: light dark;
+  --bg: Canvas;
+  --fg: CanvasText;
+  --panel: color-mix(in srgb, Canvas 94%, CanvasText 6%);
+  --border: color-mix(in srgb, CanvasText 18%, transparent);
+  --muted: color-mix(in srgb, CanvasText 58%, transparent);
+  --blue: #2f7cff;
+  --blue-bg: color-mix(in srgb, #2f7cff 18%, transparent);
+  --hold: #d18a00;
+  --hold-bg: color-mix(in srgb, #d18a00 22%, transparent);
+  --queued-bg: color-mix(in srgb, #2f7cff 10%, transparent);
+}
+*{box-sizing:border-box}
+body{
+  margin:0;background:var(--bg);color:var(--fg);
+  font-family:system-ui,-apple-system,"Noto Sans TC","PingFang TC","Microsoft JhengHei",sans-serif
+}
+.app{max-width:900px;margin:auto;padding:12px 12px 28px}
+h1{font-size:1.22rem;margin:.3rem 0 .8rem}
+.card{
+  background:var(--panel);border:1px solid var(--border);
+  border-radius:14px;padding:12px;margin:10px 0
+}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+button,input{font:inherit}
+button{
+  padding:9px 12px;border:1px solid var(--border);
+  border-radius:10px;background:Canvas;color:CanvasText
+}
+button:disabled{opacity:.45}
+input{
+  min-width:0;padding:9px;border:1px solid var(--border);
+  border-radius:9px;background:Canvas;color:CanvasText
+}
+#sourceWord{flex:1;min-width:10em}
+.status,.small{font-size:.84rem;color:var(--muted)}
+.stream{
+  min-height:150px;margin-top:10px;padding:12px;
+  border:1px solid var(--border);border-radius:10px;background:Canvas;
+  line-height:2.15;font-size:1.14rem;white-space:pre-wrap;word-break:break-word
+}
+.final{display:inline}
+.char{
+  display:inline-flex;align-items:center;justify-content:center;
+  min-width:1.65em;height:1.65em;margin:0 .035em;
+  border-radius:.38em;vertical-align:middle;user-select:none
+}
+.live{
+  color:var(--blue);background:var(--blue-bg);
+  border:1px solid color-mix(in srgb,var(--blue) 55%,transparent);
+  cursor:pointer
+}
+.live:hover{filter:brightness(1.08)}
+.held{
+  color:CanvasText;background:var(--hold-bg);
+  border:1px solid color-mix(in srgb,var(--hold) 60%,transparent)
+}
+.held.target{
+  outline:2px solid var(--hold);outline-offset:2px;
+  font-weight:700
+}
+.queued{
+  color:var(--blue);background:var(--queued-bg);
+  border-bottom:2px dotted color-mix(in srgb,var(--blue) 55%,transparent)
+}
+.box{
+  margin-top:9px;padding:9px 10px;border:1px dashed var(--border);
+  border-radius:9px;min-height:44px
+}
+.legend{display:flex;gap:12px;flex-wrap:wrap;margin-top:8px}
+.dot{display:inline-block;width:.8em;height:.8em;border-radius:3px;margin-right:.3em;vertical-align:-.05em}
+.dot.live{display:inline-block}
+.dot.held{display:inline-block}
+</style>
+</head>
+<body>
+<div class="app">
+  <h1>Streaming ASR Correction Prototype v3</h1>
+
+  <section class="card">
+    <div class="row">
+      <button id="micBtn">🎙 開始辨識</button>
+      <button id="clearBtn">清除</button>
+      <span id="status" class="status">尚未啟動</span>
+    </div>
+
+    <div id="stream" class="stream"></div>
+
+    <div class="legend small">
+      <span><i class="dot live"></i>藍色：ASR provisional，可點</span>
+      <span><i class="dot held"></i>橘色：已抽離 ASR、等待人工定字</span>
+      <span>黑色：已 final / 已人工釋放</span>
+    </div>
+
+    <div id="holdInfo" class="box small">
+      尚未選取候選字。點任一藍色字元後，當下 provisional 段會被 snapshot 到自己的 buffer。
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="row">
+      <input id="sourceWord" value="證偽" placeholder="雙字詞，例如：證偽">
+      <button id="takeA" disabled>AB → A</button>
+      <button id="takeB" disabled>AB → B</button>
+      <button id="cancelHold" disabled>取消候選</button>
+    </div>
+    <div id="correctionStatus" class="small" style="margin-top:8px">
+      先點上面的藍色字元，再用雙字詞定字。
+    </div>
+  </section>
+</div>
+
+<script>
+(() => {
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+  const streamEl = document.getElementById('stream');
+  const micBtn = document.getElementById('micBtn');
+  const clearBtn = document.getElementById('clearBtn');
+  const statusEl = document.getElementById('status');
+  const holdInfo = document.getElementById('holdInfo');
+  const correctionStatus = document.getElementById('correctionStatus');
+  const sourceWord = document.getElementById('sourceWord');
+  const takeA = document.getElementById('takeA');
+  const takeB = document.getElementById('takeB');
+  const cancelHold = document.getElementById('cancelHold');
+
+  const cps = s => [...(s || '')];
+
+  // Each SpeechRecognition session owns a stable ResultList index space.
+  // We keep old sessions so already-final text never disappears after a restart.
+  let sessions = [];
+  let currentSession = null;
+  let nextSessionId = 1;
+
+  // One held segment at a time for this MVP.
+  // {sessionId, resultIndex, snapshot, targetIndex, replacement, state}
+  // state: "held" | "resolved"
+  let hold = null;
+
+  let rec = null;
+  let recState = 'idle'; // idle | starting | listening | stopping
+
+  function setRecState(s){
+    recState = s;
+    micBtn.disabled = (s === 'starting' || s === 'stopping');
+    micBtn.textContent = (s === 'listening') ? '⏹ 停止辨識' : '🎙 開始辨識';
+  }
+
+  function getSession(id){
+    return sessions.find(s => s.id === id);
+  }
+
+  function getResult(sessionId, resultIndex){
+    const s = getSession(sessionId);
+    return s?.results.get(resultIndex) || null;
+  }
+
+  // Find where the frozen snapshot most plausibly ends in the recognizer's
+  // later revised hypothesis. This lets us ignore revisions INSIDE the frozen
+  // prefix while still showing words appended after it.
+  function continuationAfter(snapshot, raw){
+    const A = cps(snapshot), B = cps(raw);
+    if (!A.length) return raw;
+    if (raw.startsWith(snapshot)) return B.slice(A.length).join('');
+
+    // Levenshtein distance from snapshot to every prefix of raw.
+    const m = A.length, n = B.length;
+    let prev = Array.from({length:n+1}, (_,j)=>j);
+    let cur = new Array(n+1);
+
+    for(let i=1;i<=m;i++){
+      cur[0]=i;
+      for(let j=1;j<=n;j++){
+        const cost = A[i-1] === B[j-1] ? 0 : 1;
+        cur[j]=Math.min(
+          prev[j]+1,
+          cur[j-1]+1,
+          prev[j-1]+cost
+        );
+      }
+      [prev,cur]=[cur,prev];
+    }
+
+    let bestJ = Math.min(m,n);
+    let bestScore = Infinity;
+    for(let j=0;j<=n;j++){
+      // Prefer a good edit match, with a small penalty for implausible boundary shifts.
+      const score = prev[j] + 0.08*Math.abs(j-m);
+      if(score < bestScore){
+        bestScore = score;
+        bestJ = j;
+      }
+    }
+    return B.slice(bestJ).join('');
+  }
+
+  function activeHold(){
+    return hold && hold.state === 'held';
+  }
+
+  function makeChar(text, cls, title){
+    const el = document.createElement('span');
+    el.className = 'char ' + cls;
+    el.textContent = text;
+    if(title) el.title = title;
+    return el;
+  }
+
+  function renderNormalResult(session, idx, r){
+    if(r.isFinal){
+      const span = document.createElement('span');
+      span.className = 'final';
+      span.textContent = r.text;
+      streamEl.appendChild(span);
+      return;
+    }
+
+    cps(r.text).forEach((ch, charIndex) => {
+      const b = makeChar(ch, 'live', `session ${session.id}, result ${idx}, char ${charIndex}`);
+      if(!activeHold()){
+        b.onclick = () => createHold(session.id, idx, charIndex);
+      }else{
+        // Keep future text visible while one earlier target is being corrected,
+        // but don't allow a second independent hold in this MVP.
+        b.style.cursor = 'default';
+        b.style.opacity = '.72';
+      }
+      streamEl.appendChild(b);
+    });
+  }
+
+  function renderHeldResult(session, idx, r){
+    const isThisHold = hold && hold.sessionId === session.id && hold.resultIndex === idx;
+    if(!isThisHold){
+      renderNormalResult(session, idx, r);
+      return;
+    }
+
+    const snap = cps(hold.snapshot);
+    const shown = snap.map((ch,i) => i === hold.targetIndex && hold.replacement ? hold.replacement : ch);
+
+    if(hold.state === 'held'){
+      shown.forEach((ch,i)=>{
+        const cls = 'held' + (i === hold.targetIndex ? ' target' : '');
+        streamEl.appendChild(makeChar(ch, cls, i === hold.targetIndex ? '等待人工定字' : 'frozen snapshot'));
+      });
+    }else{
+      const span = document.createElement('span');
+      span.className = 'final';
+      span.textContent = shown.join('');
+      streamEl.appendChild(span);
+    }
+
+    // The recognizer may continue extending/revising the SAME result index.
+    // We expose only the part after the frozen snapshot.
+    const tail = continuationAfter(hold.snapshot, r.text);
+    if(tail){
+      if(hold.state === 'held'){
+        // Even if the recognizer already marked the raw result final, it cannot
+        // be emitted ahead of an unresolved earlier character. Keep it queued.
+        cps(tail).forEach(ch => streamEl.appendChild(makeChar(ch, 'queued', 'buffered after unresolved correction')));
+      }else if(r.isFinal){
+        const span = document.createElement('span');
+        span.className = 'final';
+        span.textContent = tail;
+        streamEl.appendChild(span);
+      }else{
+        cps(tail).forEach((ch, charIndex)=>{
+          const b = makeChar(ch, 'live', 'new provisional continuation');
+          b.onclick = () => {
+            // After resolution, the tail conceptually belongs to the same raw
+            // result, but a second hold would need a richer span model.
+            correctionStatus.textContent = 'v3 先只支援一次 held span；下一版再允許 tail 裡繼續建立第二個候選。';
+          };
+          streamEl.appendChild(b);
+        });
+      }
+    }
+  }
+
+  function render(){
+    streamEl.replaceChildren();
+
+    for(const session of sessions){
+      const ids = [...session.results.keys()].sort((a,b)=>a-b);
+      for(const idx of ids){
+        const r = session.results.get(idx);
+        renderHeldResult(session, idx, r);
+      }
+    }
+
+    const held = activeHold();
+    takeA.disabled = !held;
+    takeB.disabled = !held;
+    cancelHold.disabled = !held;
+
+    if(held){
+      const r = getResult(hold.sessionId, hold.resultIndex);
+      const rawNow = r?.text ?? '';
+      const target = cps(hold.snapshot)[hold.targetIndex] ?? '';
+      const tail = continuationAfter(hold.snapshot, rawNow);
+      holdInfo.textContent =
+        `已凍結 provisional snapshot：「${hold.snapshot}」；候選字：「${target}」` +
+        (tail ? `；ASR 後續已另外排隊：「${tail}」` : '；後面的 ASR 可以繼續長。');
+    }else if(hold && hold.state === 'resolved'){
+      holdInfo.textContent = '上一個候選已人工定字並釋放；ASR 可繼續正常更新後續內容。';
+    }else{
+      holdInfo.textContent = '尚未選取候選字。點任一藍色字元後，當下 provisional 段會被 snapshot 到自己的 buffer。';
+    }
+  }
+
+  function createHold(sessionId, resultIndex, charIndex){
+    if(activeHold()) return;
+    const r = getResult(sessionId, resultIndex);
+    if(!r || r.isFinal) return;
+
+    hold = {
+      sessionId,
+      resultIndex,
+      snapshot: r.text,
+      targetIndex: charIndex,
+      replacement: null,
+      state: 'held'
+    };
+
+    const target = cps(r.text)[charIndex] ?? '';
+    correctionStatus.textContent =
+      `已把「${target}」設為候選。你可以繼續講；這一段不再接受 ASR 對前文的覆寫。`;
+    render();
+  }
+
+  function resolveWith(ch){
+    if(!activeHold() || !ch) return;
+    const old = cps(hold.snapshot)[hold.targetIndex] ?? '';
+    hold.replacement = ch;
+    hold.state = 'resolved';
+    correctionStatus.textContent = `已將「${old}」人工定為「${ch}」，held buffer 已釋放。`;
+    render();
+  }
+
+  function cancelCurrentHold(){
+    if(!activeHold()) return;
+    // Return control to ASR: discard the manual snapshot and show current raw result.
+    hold = null;
+    correctionStatus.textContent = '已取消候選，該段重新完全交給 ASR。';
+    render();
+  }
+
+  takeA.onclick = () => {
+    const a = cps(sourceWord.value);
+    if(a[0]) resolveWith(a[0]);
+  };
+  takeB.onclick = () => {
+    const a = cps(sourceWord.value);
+    if(a[1]) resolveWith(a[1]);
+  };
+  cancelHold.onclick = cancelCurrentHold;
+
+  clearBtn.onclick = () => {
+    sessions = [];
+    currentSession = null;
+    hold = null;
+    correctionStatus.textContent = '先點上面的藍色字元，再用雙字詞定字。';
+    render();
+  };
+
+  if(!SR){
+    micBtn.disabled = true;
+    statusEl.textContent = '此瀏覽器沒有 SpeechRecognition API';
+    render();
+    return;
+  }
+
+  rec = new SR();
+  rec.lang = 'zh-TW';
+  rec.continuous = true;
+  rec.interimResults = true;
+  rec.maxAlternatives = 3;
+
+  rec.onstart = () => {
+    currentSession = {
+      id: nextSessionId++,
+      results: new Map()
+    };
+    sessions.push(currentSession);
+    setRecState('listening');
+    statusEl.textContent = '辨識中';
+    render();
+  };
+
+  rec.onresult = e => {
+    if(!currentSession) return;
+
+    // Refresh all result slots currently exposed by the browser.
+    for(let i=0;i<e.results.length;i++){
+      const res = e.results[i];
+      currentSession.results.set(i, {
+        text: res[0].transcript,
+        isFinal: res.isFinal,
+        confidence: res[0].confidence
+      });
+    }
+    render();
+  };
+
+  rec.onerror = e => {
+    statusEl.textContent = `錯誤：${e.error}`;
+    setRecState('idle');
+  };
+
+  rec.onend = () => {
+    setRecState('idle');
+    statusEl.textContent = activeHold()
+      ? '辨識已停止；held buffer 仍保留，可先完成定字再重新開始。'
+      : '已停止';
+    currentSession = null;
+    render();
+  };
+
+  micBtn.onclick = () => {
+    try{
+      if(recState === 'idle'){
+        setRecState('starting');
+        statusEl.textContent = '啟動中…';
+        rec.start();
+      }else if(recState === 'listening'){
+        setRecState('stopping');
+        statusEl.textContent = '停止中…';
+        rec.stop();
+      }
+    }catch(err){
+      statusEl.textContent = String(err);
+      setRecState('idle');
+    }
+  };
+
+  render();
+})();
+</script>
+</body>
+</html>
