@@ -1,0 +1,386 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Streaming ASR × 手寫筆順 Prototype</title>
+<style>
+:root{
+  color-scheme: light dark;
+  --bg: Canvas; --fg: CanvasText; --panel: color-mix(in srgb, Canvas 94%, CanvasText 6%);
+  --muted: color-mix(in srgb, CanvasText 58%, transparent);
+  --border: color-mix(in srgb, CanvasText 18%, transparent);
+  --accent: LinkText;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,"Noto Sans TC","PingFang TC","Microsoft JhengHei",sans-serif}
+.app{max-width:980px;margin:auto;padding:12px 12px 28px}
+h1{font-size:1.25rem;margin:.3rem 0 .8rem}
+h2{font-size:1rem;margin:.2rem 0 .65rem}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:12px;margin:10px 0}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+button,input,textarea{font:inherit}
+button{padding:9px 12px;border:1px solid var(--border);border-radius:10px;background:Canvas;color:CanvasText}
+button:active{transform:translateY(1px)}
+input{min-width:0;padding:9px;border:1px solid var(--border);border-radius:9px;background:Canvas;color:CanvasText}
+#targetChar{width:5em;text-align:center;font-size:1.25rem}
+#sourceWord{flex:1;min-width:10em}
+.status{font-size:.88rem;color:var(--muted)}
+.stream{min-height:100px;padding:12px;border:1px solid var(--border);border-radius:10px;background:Canvas;line-height:1.75;font-size:1.08rem;white-space:pre-wrap}
+.interim-char{display:inline-flex;align-items:center;justify-content:center;min-width:1.65em;height:1.65em;margin:0 .04em;border:1px solid #2f7cff;border-radius:.38em;background:color-mix(in srgb,#2f7cff 16%,transparent);color:#2f7cff;cursor:pointer;user-select:none;vertical-align:middle}
+.interim-char.selected{outline:2px solid #2f7cff;outline-offset:2px}
+#selectionInfo{margin-top:8px;font-size:.88rem;color:var(--muted)}
+canvas{display:block;width:100%;height:min(66vw,420px);background:Canvas;border:1px solid var(--border);border-radius:12px;touch-action:none}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+@media(max-width:720px){.grid{grid-template-columns:1fr}}
+.metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:8px}
+.metric{padding:8px;border:1px solid var(--border);border-radius:10px;text-align:center}
+.metric b{display:block;font-size:1.15rem}
+.small{font-size:.83rem;color:var(--muted)}
+.cands{display:flex;gap:7px;flex-wrap:wrap;margin-top:8px}
+.cand{padding:7px 10px;border-radius:999px;border:1px solid var(--border);cursor:pointer}
+.wordpick button{min-width:48px}
+code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}
+</style>
+</head>
+<body>
+<div class="app">
+  <h1>Streaming ASR × 手寫筆順 Prototype</h1>
+
+  <section class="card">
+    <h2>1. Streaming ASR buffer（瀏覽器能力測試）</h2>
+    <div class="row">
+      <button id="micBtn">🎙 開始辨識</button>
+      <button id="clearText">清除文字</button>
+      <span id="asrStatus" class="status">尚未啟動</span>
+    </div>
+    <div id="stream" class="stream"><span id="finalText"></span><span id="interimText"></span></div>
+    <div id="selectionInfo">目前選取：—</div>
+    <div class="small">黑字 = final；藍色按鈕 = provisional/interim。點一個藍字後，可用下方 AB→A / AB→B 直接替換。</div>
+  </section>
+
+  <section class="card">
+    <h2>2. 「以詞定字」最小 correction channel</h2>
+    <div class="row wordpick">
+      <input id="sourceWord" value="證偽" placeholder="輸入來源詞，例如：證偽">
+      <button id="take1">AB → A</button>
+      <button id="take2">AB → B</button>
+      <button id="appendWord">整詞加入 final</button>
+    </div>
+    <div class="small">先不做完整候選系統，只驗證「同一 composition state 上可直接用另一種 disambiguation channel 修正」的互動。</div>
+  </section>
+
+  <section class="card">
+    <h2>3. 手寫筆跡 stream + canonical 筆順比對</h2>
+    <div class="row">
+      <label>目標字 <input id="targetChar" maxlength="1" value="偽"></label>
+      <button id="loadChar">載入筆順</button>
+      <button id="undoStroke">撤銷一筆</button>
+      <button id="clearInk">清除筆跡</button>
+      <span id="inkStatus" class="status">尚未載入字形資料</span>
+    </div>
+
+    <div class="grid" style="margin-top:10px">
+      <div>
+        <div class="small">你的筆跡（每次 pointer down → up 算一筆）</div>
+        <canvas id="ink"></canvas>
+      </div>
+      <div>
+        <div class="small">Canonical stroke medians（依序畫出）</div>
+        <canvas id="canon"></canvas>
+      </div>
+    </div>
+
+    <div class="metrics">
+      <div class="metric"><span class="small">你的筆數</span><b id="userCount">0</b></div>
+      <div class="metric"><span class="small">標準筆數</span><b id="canonCount">—</b></div>
+      <div class="metric"><span class="small">順序粗略分數</span><b id="score">—</b></div>
+    </div>
+    <div id="strokeInfo" class="small" style="margin-top:8px"></div>
+    <div class="small" style="margin-top:6px">
+      這裡的「分數」只用每一筆的起終點、方向與粗略路徑做 heuristic comparison，目的只是驗證資料流；
+      真正的中文字候選辨識在 Android 版可改用 ML Kit Digital Ink Recognition。
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>4. Raw stroke stream</h2>
+    <div class="row">
+      <button id="copyJson">複製 JSON</button>
+      <span id="copyStatus" class="status"></span>
+    </div>
+    <textarea id="jsonOut" readonly style="width:100%;height:140px;margin-top:8px"></textarea>
+  </section>
+</div>
+
+<script>
+(() => {
+  // ---------- shared transcript ----------
+  const finalEl = document.getElementById('finalText');
+  const interimEl = document.getElementById('interimText');
+  const selectionInfo = document.getElementById('selectionInfo');
+  let interimRaw = '';
+  let selectedInterimIndex = null;
+  let manualInterim = new Map();
+
+  function appendText(t){
+    finalEl.textContent += t;
+  }
+
+  function renderInterim(){
+    interimEl.replaceChildren();
+    const a = [...interimRaw];
+    for(let i=0;i<a.length;i++){
+      const b=document.createElement('span');
+      b.className='interim-char' + (selectedInterimIndex===i?' selected':'');
+      b.textContent=manualInterim.has(i)?manualInterim.get(i):a[i];
+      b.title=`原 ASR：${a[i]}；index ${i}`;
+      b.onclick=()=>{
+        selectedInterimIndex=i;
+        selectionInfo.textContent=`目前選取：${b.textContent}（interim index ${i}；原 ASR：${a[i]}）`;
+        renderInterim();
+      };
+      interimEl.appendChild(b);
+    }
+  }
+
+  function replaceSelected(ch){
+    if(selectedInterimIndex===null){
+      selectionInfo.textContent='目前選取：—（請先點一個藍色 provisional 字元）';
+      return;
+    }
+    const a=[...interimRaw];
+    if(a[selectedInterimIndex]===undefined){
+      selectedInterimIndex=null;
+      selectionInfo.textContent='選取位置已被 ASR revision 移除，請重新點選。';
+      return;
+    }
+    manualInterim.set(selectedInterimIndex,ch);
+    selectionInfo.textContent=`目前選取：${ch}（人工替換；原 ASR：${a[selectedInterimIndex]}）`;
+    renderInterim();
+  }
+
+  // ---------- Web Speech API ----------
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  const micBtn = document.getElementById('micBtn');
+  const asrStatus = document.getElementById('asrStatus');
+  let rec = null, listening = false;
+
+  if (SR) {
+    rec = new SR();
+    rec.lang = 'zh-TW';
+    rec.continuous = true;
+    rec.interimResults = true;
+    rec.maxAlternatives = 3;
+
+    rec.onstart = () => { listening = true; micBtn.textContent='⏹ 停止辨識'; asrStatus.textContent='辨識中'; };
+    rec.onend = () => { listening = false; micBtn.textContent='🎙 開始辨識'; asrStatus.textContent='已停止'; interimRaw=''; manualInterim.clear(); selectedInterimIndex=null; renderInterim(); };
+    rec.onerror = e => { asrStatus.textContent='錯誤：'+e.error; };
+    rec.onresult = e => {
+      let interim = '';
+      for(let i=e.resultIndex;i<e.results.length;i++){
+        const text = e.results[i][0].transcript;
+        if(e.results[i].isFinal) appendText(text);
+        else interim += text;
+      }
+      // Preserve simple index-based manual patches while the current hypothesis still has that position.
+      const newLen=[...interim].length;
+      for(const idx of [...manualInterim.keys()]) if(idx>=newLen) manualInterim.delete(idx);
+      if(selectedInterimIndex!==null && selectedInterimIndex>=newLen) selectedInterimIndex=null;
+      interimRaw = interim;
+      renderInterim();
+    };
+    micBtn.onclick = () => {
+      try { listening ? rec.stop() : rec.start(); }
+      catch(e){ asrStatus.textContent = String(e); }
+    };
+  } else {
+    micBtn.disabled = true;
+    asrStatus.textContent = '此瀏覽器沒有 SpeechRecognition API';
+  }
+
+  document.getElementById('clearText').onclick = () => {
+    finalEl.textContent=''; interimRaw=''; manualInterim.clear(); selectedInterimIndex=null; selectionInfo.textContent='目前選取：—'; renderInterim();
+  };
+
+  // ---------- word -> character ----------
+  function sourceWord(){ return [...document.getElementById('sourceWord').value]; }
+  document.getElementById('take1').onclick = () => { const a=sourceWord(); if(a[0]) replaceSelected(a[0]); };
+  document.getElementById('take2').onclick = () => { const a=sourceWord(); if(a[1]) replaceSelected(a[1]); };
+  document.getElementById('appendWord').onclick = () => { appendText(document.getElementById('sourceWord').value); };
+
+  // ---------- canvas / ink ----------
+  const ink = document.getElementById('ink');
+  const canon = document.getElementById('canon');
+  const ictx = ink.getContext('2d');
+  const cctx = canon.getContext('2d');
+  let strokes = [];
+  let current = null;
+  let canonical = null;
+
+  function resizeCanvas(c, ctx) {
+    const r = c.getBoundingClientRect(), dpr = devicePixelRatio || 1;
+    c.width = Math.round(r.width*dpr); c.height = Math.round(r.height*dpr);
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+  }
+  function resizeAll(){ resizeCanvas(ink,ictx); resizeCanvas(canon,cctx); redrawInk(); drawCanonical(); }
+  addEventListener('resize', resizeAll);
+
+  function pt(e,c){
+    const r=c.getBoundingClientRect();
+    return {x:e.clientX-r.left,y:e.clientY-r.top,t:performance.now()};
+  }
+  ink.addEventListener('pointerdown', e=>{
+    ink.setPointerCapture(e.pointerId);
+    current=[pt(e,ink)]; strokes.push(current); redrawInk();
+  });
+  ink.addEventListener('pointermove', e=>{
+    if(!current) return;
+    current.push(pt(e,ink)); redrawInk();
+  });
+  function endStroke(){ if(current && current.length<2) current.push({...current[0],t:performance.now()}); current=null; update(); }
+  ink.addEventListener('pointerup', endStroke);
+  ink.addEventListener('pointercancel', endStroke);
+
+  function drawPath(ctx, arr, width=3){
+    if(!arr || arr.length<1) return;
+    ctx.beginPath(); ctx.moveTo(arr[0].x,arr[0].y);
+    for(let i=1;i<arr.length;i++) ctx.lineTo(arr[i].x,arr[i].y);
+    ctx.lineWidth=width; ctx.lineCap='round'; ctx.lineJoin='round'; ctx.strokeStyle=getComputedStyle(document.body).color; ctx.stroke();
+  }
+  function redrawInk(){
+    const r=ink.getBoundingClientRect();
+    ictx.clearRect(0,0,r.width,r.height);
+    strokes.forEach((s,i)=>{
+      drawPath(ictx,s,3);
+      if(s[0]) { ictx.font='14px system-ui'; ictx.fillStyle=getComputedStyle(document.body).color; ictx.fillText(String(i+1),s[0].x+4,s[0].y-4); }
+    });
+  }
+
+  function drawCanonical(){
+    const r=canon.getBoundingClientRect();
+    cctx.clearRect(0,0,r.width,r.height);
+    if(!canonical || !canonical.medians) return;
+    const W=r.width,H=r.height,pad=18;
+    canonical.medians.forEach((m,i)=>{
+      const pts=m.map(([x,y])=>({x:pad+(x/1024)*(W-2*pad), y:pad+((1024-y)/1024)*(H-2*pad)}));
+      drawPath(cctx,pts,3);
+      if(pts[0]) { cctx.font='14px system-ui'; cctx.fillStyle=getComputedStyle(document.body).color; cctx.fillText(String(i+1),pts[0].x+4,pts[0].y-4); }
+    });
+  }
+
+  // Normalize a stroke into N points in [0,1]^2, preserving direction.
+  function resample(points, n=16){
+    if(!points || points.length===0) return [];
+    const seg=[], cum=[0]; let total=0;
+    for(let i=1;i<points.length;i++){
+      const d=Math.hypot(points[i].x-points[i-1].x,points[i].y-points[i-1].y);
+      seg.push(d); total+=d; cum.push(total);
+    }
+    if(total===0) return Array(n).fill({x:points[0].x,y:points[0].y});
+    const out=[];
+    for(let k=0;k<n;k++){
+      const target=total*k/(n-1);
+      let i=1; while(i<cum.length && cum[i]<target) i++;
+      if(i>=cum.length){ out.push({...points[points.length-1]}); continue; }
+      const d=cum[i]-cum[i-1], a=d ? (target-cum[i-1])/d : 0;
+      out.push({x:points[i-1].x+a*(points[i].x-points[i-1].x), y:points[i-1].y+a*(points[i].y-points[i-1].y)});
+    }
+    return out;
+  }
+
+  function unitNormalize(points){
+    const xs=points.map(p=>p.x), ys=points.map(p=>p.y);
+    const minx=Math.min(...xs), maxx=Math.max(...xs), miny=Math.min(...ys), maxy=Math.max(...ys);
+    const scale=Math.max(maxx-minx,maxy-miny,1);
+    return points.map(p=>({x:(p.x-minx)/scale,y:(p.y-miny)/scale}));
+  }
+
+  function canonicalStroke(i){
+    const m=canonical.medians[i];
+    return m.map(([x,y])=>({x:x,y:1024-y}));
+  }
+
+  // Shape/order heuristic. Low distance = better.
+  function strokeDistance(a,b){
+    a=unitNormalize(resample(a)); b=unitNormalize(resample(b));
+    if(!a.length || !b.length) return 2;
+    let d=0;
+    for(let i=0;i<a.length;i++) d+=Math.hypot(a[i].x-b[i].x,a[i].y-b[i].y);
+    // retain global direction information
+    const da={x:a.at(-1).x-a[0].x,y:a.at(-1).y-a[0].y};
+    const db={x:b.at(-1).x-b[0].x,y:b.at(-1).y-b[0].y};
+    d/=a.length;
+    d += 0.35*Math.hypot(da.x-db.x,da.y-db.y);
+    return d;
+  }
+
+  function roughType(s){
+    if(!s || s.length<2) return '?';
+    const a=s[0], b=s.at(-1), dx=b.x-a.x, dy=b.y-a.y;
+    const adx=Math.abs(dx), ady=Math.abs(dy);
+    if(Math.hypot(dx,dy)<14) return '點';
+    if(adx>ady*2) return dx>0?'橫→':'橫←';
+    if(ady>adx*2) return dy>0?'豎↓':'豎↑';
+    if(dx<0 && dy>0) return '撇↙';
+    if(dx>0 && dy>0) return '捺↘';
+    if(dx>0 && dy<0) return '提↗';
+    return '斜';
+  }
+
+  function update(){
+    document.getElementById('userCount').textContent=strokes.length;
+    document.getElementById('canonCount').textContent=canonical?.medians?.length ?? '—';
+    const info=strokes.map((s,i)=>`${i+1}:${roughType(s)}`).join('　');
+    document.getElementById('strokeInfo').textContent=info || '尚未下筆';
+
+    let score='—';
+    if(canonical?.medians?.length && strokes.length){
+      const n=Math.min(strokes.length, canonical.medians.length);
+      let d=0;
+      for(let i=0;i<n;i++) d+=strokeDistance(strokes[i],canonicalStroke(i));
+      d/=n;
+      const countPenalty=Math.abs(strokes.length-canonical.medians.length)*0.18;
+      const pct=Math.max(0,Math.min(100,Math.round(100*(1-(d+countPenalty)/1.5))));
+      score=pct+'%';
+    }
+    document.getElementById('score').textContent=score;
+    document.getElementById('jsonOut').value=JSON.stringify({
+      target:document.getElementById('targetChar').value,
+      strokes
+    },null,2);
+  }
+
+  async function loadCharacter(){
+    const ch=[...document.getElementById('targetChar').value][0];
+    if(!ch) return;
+    const st=document.getElementById('inkStatus');
+    st.textContent='載入中…';
+    try{
+      const url=`https://cdn.jsdelivr.net/npm/hanzi-writer-data@latest/${encodeURIComponent(ch)}.json`;
+      const r=await fetch(url);
+      if(!r.ok) throw new Error(`HTTP ${r.status}`);
+      canonical=await r.json();
+      st.textContent=`已載入「${ch}」`;
+      drawCanonical(); update();
+    }catch(e){
+      canonical=null; drawCanonical(); update();
+      st.textContent='載入失敗：'+e.message;
+    }
+  }
+
+  document.getElementById('loadChar').onclick=loadCharacter;
+  document.getElementById('clearInk').onclick=()=>{strokes=[];current=null;redrawInk();update();};
+  document.getElementById('undoStroke').onclick=()=>{strokes.pop();current=null;redrawInk();update();};
+  document.getElementById('copyJson').onclick=async()=>{
+    try{
+      await navigator.clipboard.writeText(document.getElementById('jsonOut').value);
+      document.getElementById('copyStatus').textContent='已複製';
+    }catch(e){ document.getElementById('copyStatus').textContent='瀏覽器不允許剪貼簿；可直接選取下方 JSON'; }
+  };
+
+  requestAnimationFrame(()=>{resizeAll(); renderInterim(); update(); loadCharacter();});
+})();
+</script>
+</body>
+</html>
