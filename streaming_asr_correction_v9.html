@@ -1,0 +1,629 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Streaming ASR Correction Prototype v9</title>
+<style>
+:root{
+  color-scheme:light dark;
+  --bg:Canvas;--fg:CanvasText;
+  --panel:color-mix(in srgb,Canvas 94%,CanvasText 6%);
+  --border:color-mix(in srgb,CanvasText 18%,transparent);
+  --muted:color-mix(in srgb,CanvasText 58%,transparent);
+  --blue:#2f7cff;--blue-bg:color-mix(in srgb,#2f7cff 18%,transparent);
+  --orange:#d18a00;--orange-bg:color-mix(in srgb,#d18a00 22%,transparent);
+  --red:#e03636;--red-bg:color-mix(in srgb,#e03636 25%,transparent);
+  --green:#279b55;--green-bg:color-mix(in srgb,#279b55 22%,transparent);
+  --purple:#7d58d6;--purple-bg:color-mix(in srgb,#7d58d6 18%,transparent);
+}
+*{box-sizing:border-box}
+body{
+  margin:0;background:var(--bg);color:var(--fg);
+  font-family:system-ui,-apple-system,"Noto Sans TC","PingFang TC","Microsoft JhengHei",sans-serif
+}
+.app{max-width:980px;margin:auto;padding:12px 12px 32px}
+h1{font-size:1.22rem;margin:.3rem 0 .8rem}
+h2{font-size:1rem;margin:.15rem 0 .7rem}
+.card{
+  background:var(--panel);border:1px solid var(--border);
+  border-radius:14px;padding:12px;margin:10px 0
+}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+button,input{font:inherit}
+button{
+  padding:8px 11px;border:1px solid var(--border);
+  border-radius:10px;background:Canvas;color:CanvasText
+}
+button:disabled{opacity:.42}
+button.literal{
+  border-color:color-mix(in srgb,var(--green) 65%,transparent);
+  background:var(--green-bg)
+}
+input{
+  min-width:0;padding:8px;border:1px solid var(--border);
+  border-radius:9px;background:Canvas;color:CanvasText
+}
+input[type=number]{width:5.3em}
+.status,.small{font-size:.84rem;color:var(--muted)}
+.stream{
+  min-height:165px;margin-top:10px;padding:12px;
+  border:1px solid var(--border);border-radius:10px;background:Canvas;
+  line-height:2.15;font-size:1.14rem;white-space:pre-wrap;word-break:break-word
+}
+.final{display:inline}
+.livechar{
+  display:inline-flex;align-items:center;justify-content:center;
+  min-width:1.65em;height:1.65em;margin:0 .035em;
+  border-radius:.38em;vertical-align:middle;user-select:none;
+  color:var(--blue);background:var(--blue-bg);
+  border:1px solid color-mix(in srgb,var(--blue) 55%,transparent);
+  cursor:pointer
+}
+.placeholder{
+  display:inline-flex;align-items:center;justify-content:center;
+  min-height:1.65em;margin:0 .08em;padding:0 .48em;
+  border-radius:.42em;vertical-align:middle;
+  background:var(--purple-bg);
+  border:1px dashed color-mix(in srgb,var(--purple) 72%,transparent);
+  color:var(--purple);font-weight:750
+}
+.workspace{display:grid;gap:10px}
+.editcard{
+  border:1px solid color-mix(in srgb,var(--orange) 55%,var(--border));
+  border-radius:12px;padding:10px;background:color-mix(in srgb,var(--orange-bg) 38%,Canvas)
+}
+.edithead{
+  display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap;
+  margin-bottom:8px
+}
+.edittext{line-height:2.05;font-size:1.12rem;word-break:break-word;margin-bottom:9px}
+.echar{
+  display:inline-flex;align-items:center;justify-content:center;
+  min-width:1.65em;height:1.65em;margin:0 .035em;
+  border-radius:.38em;vertical-align:middle;user-select:none;cursor:pointer;
+  background:var(--orange-bg);
+  border:1px solid color-mix(in srgb,var(--orange) 60%,transparent)
+}
+.echar.target{outline:2px solid var(--orange);outline-offset:2px;font-weight:800}
+.echar.edited{
+  background:var(--red-bg);
+  border-color:color-mix(in srgb,var(--red) 72%,transparent);
+  font-weight:800
+}
+.echar.literal{
+  background:var(--green-bg);
+  border-color:color-mix(in srgb,var(--green) 72%,transparent);
+  font-weight:800
+}
+.controls{display:flex;gap:7px;align-items:center;flex-wrap:wrap}
+.wordinput{flex:1;min-width:11em}
+.legend{display:flex;gap:12px;flex-wrap:wrap;margin-top:8px}
+.dot{display:inline-block;width:.8em;height:.8em;border-radius:3px;margin-right:.3em;vertical-align:-.05em}
+.empty{
+  padding:14px;border:1px dashed var(--border);border-radius:10px;text-align:center;color:var(--muted)
+}
+.timer{font-variant-numeric:tabular-nums;font-weight:700}
+</style>
+</head>
+<body>
+<div class="app">
+  <h1>Streaming ASR Correction Prototype v9</h1>
+
+  <section class="card">
+    <div class="row">
+      <button id="micBtn">🎙 開始辨識</button>
+      <button id="clearBtn">清除全部</button>
+      <label class="small">無操作後定稿
+        <input id="graceSec" type="number" min="1" max="30" step="0.5" value="5"> 秒
+      </label>
+      <span id="status" class="status">尚未啟動</span><span class="small">V9：多 buffer 效能修正版</span>
+    </div>
+
+    <div id="stream" class="stream"></div>
+
+    <div class="legend small">
+      <span><i class="dot" style="background:var(--blue-bg);border:1px solid var(--blue)"></i>藍：目前 ASR provisional buffer，可點抽出</span>
+      <span><i class="dot" style="background:var(--purple-bg);border:1px dashed var(--purple)"></i>紫：文章中的 placeholder</span>
+      <span>黑：已 final / 已修正後定稿</span>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>待修正 buffers</h2>
+    <div id="workspace" class="workspace"></div>
+  </section>
+</div>
+
+<script>
+(() => {
+  const PUNCT_COMMANDS = new Map([
+    ['逗點','，'],['逗號','，'],
+    ['句點','。'],['句號','。']
+  ]);
+
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  const cps = s => [...(s || '')];
+
+  const streamEl = document.getElementById('stream');
+  const workspaceEl = document.getElementById('workspace');
+  const micBtn = document.getElementById('micBtn');
+  const clearBtn = document.getElementById('clearBtn');
+  const graceSecEl = document.getElementById('graceSec');
+  const statusEl = document.getElementById('status');
+
+  let sessions = [];
+  let currentSession = null;
+  let nextSessionId = 1;
+  let nextBlockId = 1;
+
+  /*
+    blocks are detached snapshots.
+    Multiple blocks can belong to the same ASR result index.
+
+    {
+      id,
+      sessionId,
+      resultIndex,
+      segmentText,        // only the visible live tail extracted at that moment
+      boundarySnapshot,   // entire raw ASR result at extraction time
+      targetIndex,
+      edits: Map(index -> {text, kind}),
+      state: "pending" | "committed",
+      deadline
+    }
+  */
+  let blocks = [];
+
+  let rec = null;
+  let recState = 'idle';
+
+  // Timer labels are updated in-place; do not rebuild the whole DOM at 10 FPS.
+  const timerNodes = new Map();
+
+  function setRecState(s){
+    recState=s;
+    micBtn.disabled=(s==='starting'||s==='stopping');
+    micBtn.textContent=(s==='listening')?'⏹ 停止辨識':'🎙 開始辨識';
+  }
+
+  function graceMs(){
+    const sec=Math.max(1,Math.min(30,Number(graceSecEl.value)||5));
+    return sec*1000;
+  }
+
+  function getSession(id){ return sessions.find(s=>s.id===id); }
+  function getResult(sessionId,resultIndex){
+    return getSession(sessionId)?.results.get(resultIndex)||null;
+  }
+
+  function blocksFor(sessionId,resultIndex){
+    return blocks
+      .filter(b=>b.sessionId===sessionId && b.resultIndex===resultIndex)
+      .sort((a,b)=>a.id-b.id);
+  }
+
+  // Recover the visible continuation after a detached snapshot.
+  // V8 used full Levenshtein alignment over the whole transcript on every render.
+  // V9 deliberately keeps this cheap: exact prefix first, then anchors on a short
+  // suffix near the expected boundary, finally falls back to the expected length.
+  function continuationAfter(snapshot, raw){
+    const A=cps(snapshot), B=cps(raw);
+    if(!A.length) return raw;
+    if(raw.startsWith(snapshot)) return B.slice(A.length).join('');
+
+    const expected=Math.min(A.length,B.length);
+
+    // Try progressively shorter suffix anchors from the old snapshot.
+    // Search only near the old boundary so repeated phrases earlier in the text
+    // do not usually steal the match.
+    const maxAnchor=Math.min(16,A.length);
+    const minAnchor=Math.min(4,maxAnchor);
+    const lo=Math.max(0, expected-28);
+    const hi=Math.min(B.length, expected+40);
+    const windowText=B.slice(lo,hi).join('');
+
+    for(let k=maxAnchor;k>=minAnchor;k--){
+      const anchor=A.slice(A.length-k).join('');
+      const pos=windowText.lastIndexOf(anchor);
+      if(pos!==-1){
+        const boundary=lo+pos+k;
+        return B.slice(boundary).join('');
+      }
+    }
+
+    // Fallback: preserve the old approximate boundary by character count.
+    return B.slice(expected).join('');
+  }
+
+  function visibleTail(sessionId,resultIndex,raw){
+    const bs=blocksFor(sessionId,resultIndex);
+    if(!bs.length) return raw;
+    return continuationAfter(bs.at(-1).boundarySnapshot, raw);
+  }
+
+  function renderedBlockText(block){
+    const arr=cps(block.segmentText);
+    for(const [idx,obj] of block.edits.entries()){
+      if(idx>=0 && idx<arr.length) arr[idx]=obj.text;
+    }
+    return arr.join('');
+  }
+
+  function resetTimer(block){
+    if(block.state!=='pending') return;
+    block.deadline=Date.now()+graceMs();
+    render();
+  }
+
+  function commitBlock(block){
+    if(!block || block.state!=='pending') return;
+    block.targetIndex=null;
+    block.state='committed';
+    block.deadline=0;
+    render();
+  }
+
+  function detachBuffer(sessionId,resultIndex,targetIndex){
+    const r=getResult(sessionId,resultIndex);
+    if(!r || r.isFinal) return;
+
+    const segment=visibleTail(sessionId,resultIndex,r.text);
+    if(!segment) return;
+
+    const block={
+      id:nextBlockId++,
+      sessionId,
+      resultIndex,
+      segmentText:segment,
+      boundarySnapshot:r.text,
+      targetIndex,
+      edits:new Map(),
+      state:'pending',
+      deadline:Date.now()+graceMs()
+    };
+    blocks.push(block);
+    render();
+  }
+
+  function renderLiveText(text,onClick){
+    cps(text).forEach((ch,i)=>{
+      const b=document.createElement('span');
+      b.className='livechar';
+      b.textContent=ch;
+      b.title='點一下：把目前整塊 provisional buffer 抽到下面修';
+      b.onclick=()=>onClick(i);
+      streamEl.appendChild(b);
+    });
+  }
+
+  function renderResult(session,idx,r){
+    const bs=blocksFor(session.id,idx);
+
+    if(!bs.length){
+      if(r.isFinal){
+        const s=document.createElement('span');
+        s.className='final';
+        s.textContent=r.text;
+        streamEl.appendChild(s);
+      }else{
+        renderLiveText(r.text, i=>detachBuffer(session.id,idx,i));
+      }
+      return;
+    }
+
+    // Each extracted segment occupies a stable placeholder until committed.
+    for(const block of bs){
+      if(block.state==='pending'){
+        const ph=document.createElement('span');
+        ph.className='placeholder';
+        ph.textContent=`〔修正#${block.id}〕`;
+        ph.title=`原文：${block.segmentText}`;
+        streamEl.appendChild(ph);
+      }else{
+        const s=document.createElement('span');
+        s.className='final';
+        s.textContent=renderedBlockText(block);
+        streamEl.appendChild(s);
+      }
+    }
+
+    // Whatever ASR has produced after the last extraction remains live/final.
+    const tail=continuationAfter(bs.at(-1).boundarySnapshot,r.text);
+    if(!tail) return;
+
+    if(r.isFinal){
+      const s=document.createElement('span');
+      s.className='final';
+      s.textContent=tail;
+      streamEl.appendChild(s);
+    }else{
+      renderLiveText(tail, i=>detachBuffer(session.id,idx,i));
+    }
+  }
+
+  function selectChar(block,index){
+    if(block.state!=='pending') return;
+    block.targetIndex=index;
+    resetTimer(block);
+  }
+
+  function applyReplacement(block,text,kind='edit'){
+    if(block.state!=='pending' || block.targetIndex===null || !text) return;
+    block.edits.set(block.targetIndex,{text,kind});
+    block.targetIndex=null;
+    resetTimer(block);
+  }
+
+  function smartTake(block,word,which){
+    if(block.state!=='pending' || block.targetIndex===null) return;
+    const raw=word.trim();
+
+    if(PUNCT_COMMANDS.has(raw)){
+      applyReplacement(block,PUNCT_COMMANDS.get(raw),'edit');
+      return;
+    }
+
+    const a=cps(raw);
+    const ch=which==='A'?a[0]:a[1];
+    if(ch) applyReplacement(block,ch,'edit');
+  }
+
+  function undoThis(block){
+    if(block.state!=='pending' || block.targetIndex===null) return;
+    block.edits.delete(block.targetIndex);
+    block.targetIndex=null;
+    resetTimer(block);
+  }
+
+  function cancelSelection(block){
+    if(block.state!=='pending') return;
+    block.targetIndex=null;
+    resetTimer(block);
+  }
+
+  function undoAll(block){
+    if(block.state!=='pending') return;
+    block.edits.clear();
+    block.targetIndex=null;
+    resetTimer(block);
+  }
+
+  function renderWorkspace(){
+    workspaceEl.replaceChildren();
+    timerNodes.clear();
+
+    const pending=blocks.filter(b=>b.state==='pending');
+
+    if(!pending.length){
+      const e=document.createElement('div');
+      e.className='empty';
+      e.textContent='目前沒有待修正 buffer。點上面任一藍色字元，就會把那整塊 provisional buffer 拉到這裡。';
+      workspaceEl.appendChild(e);
+      return;
+    }
+
+    for(const block of pending){
+      const card=document.createElement('div');
+      card.className='editcard';
+
+      const head=document.createElement('div');
+      head.className='edithead';
+
+      const title=document.createElement('div');
+      title.innerHTML=`<b>修正#${block.id}</b> <span class="small">原 ASR buffer：${escapeHtml(block.segmentText)}</span>`;
+
+      const timer=document.createElement('div');
+      timer.className='small timer';
+      const remain=Math.max(0,block.deadline-Date.now());
+      timer.textContent=`${(remain/1000).toFixed(1)} s`;
+      timerNodes.set(block.id,timer);
+
+      head.append(title,timer);
+      card.appendChild(head);
+
+      const text=document.createElement('div');
+      text.className='edittext';
+
+      const original=cps(block.segmentText);
+      const shown=cps(block.segmentText);
+
+      for(const [idx,obj] of block.edits.entries()){
+        if(idx>=0 && idx<shown.length) shown[idx]=obj.text;
+      }
+
+      shown.forEach((ch,i)=>{
+        const obj=block.edits.get(i);
+        const b=document.createElement('span');
+        let cls='echar';
+        if(obj?.kind==='edit') cls+=' edited';
+        if(obj?.kind==='literal') cls+=' literal';
+        if(block.targetIndex===i) cls+=' target';
+        b.className=cls;
+        b.textContent=ch;
+        b.title=obj ? `原 ASR：${original[i]}` : '點此字開始修';
+        b.onclick=()=>selectChar(block,i);
+        text.appendChild(b);
+      });
+
+      card.appendChild(text);
+
+      const controls=document.createElement('div');
+      controls.className='controls';
+
+      const word=document.createElement('input');
+      word.className='wordinput';
+      word.value='證偽';
+      word.placeholder='雙字詞；逗點/句點預設視為標點';
+
+      const a=document.createElement('button');
+      a.textContent='AB → A';
+      a.disabled=block.targetIndex===null;
+      a.onclick=()=>smartTake(block,word.value,'A');
+
+      const b=document.createElement('button');
+      b.textContent='AB → B';
+      b.disabled=block.targetIndex===null;
+      b.onclick=()=>smartTake(block,word.value,'B');
+
+      const literal=document.createElement('button');
+      literal.textContent='字面輸入';
+      literal.className='literal';
+      literal.disabled=block.targetIndex===null;
+      literal.onclick=()=>applyReplacement(block,word.value,'literal');
+
+      const undoOne=document.createElement('button');
+      undoOne.textContent='還原此字';
+      undoOne.disabled=block.targetIndex===null || !block.edits.has(block.targetIndex);
+      undoOne.onclick=()=>undoThis(block);
+
+      const cancel=document.createElement('button');
+      cancel.textContent='取消選字';
+      cancel.onclick=()=>cancelSelection(block);
+
+      const undo=document.createElement('button');
+      undo.textContent='全部還原';
+      undo.disabled=block.edits.size===0;
+      undo.onclick=()=>undoAll(block);
+
+      const commit=document.createElement('button');
+      commit.textContent='立即定稿';
+      commit.onclick=()=>commitBlock(block);
+
+      controls.append(word,a,b,literal,undoOne,cancel,undo,commit);
+      card.appendChild(controls);
+
+      workspaceEl.appendChild(card);
+    }
+  }
+
+  function escapeHtml(s){
+    return String(s)
+      .replaceAll('&','&amp;')
+      .replaceAll('<','&lt;')
+      .replaceAll('>','&gt;')
+      .replaceAll('"','&quot;')
+      .replaceAll("'","&#039;");
+  }
+
+  function render(){
+    streamEl.replaceChildren();
+
+    for(const session of sessions){
+      const ids=[...session.results.keys()].sort((a,b)=>a-b);
+      for(const idx of ids){
+        renderResult(session,idx,session.results.get(idx));
+      }
+    }
+
+    renderWorkspace();
+  }
+
+  // Independent timers for every pending placeholder.
+  // Only timer text is touched every 100 ms. A full render happens only when a
+  // block actually crosses its commit deadline.
+  setInterval(()=>{
+    const now=Date.now();
+    let committedAny=false;
+
+    for(const block of blocks){
+      if(block.state!=='pending' || !block.deadline) continue;
+
+      const remain=Math.max(0,block.deadline-now);
+      const timer=timerNodes.get(block.id);
+      if(timer) timer.textContent=`${(remain/1000).toFixed(1)} s`;
+
+      if(now>=block.deadline){
+        block.state='committed';
+        block.targetIndex=null;
+        block.deadline=0;
+        committedAny=true;
+      }
+    }
+
+    if(committedAny) render();
+  },100);
+
+  graceSecEl.addEventListener('change',()=>{
+    for(const block of blocks){
+      if(block.state==='pending') block.deadline=Date.now()+graceMs();
+    }
+    render();
+  });
+
+  clearBtn.onclick=()=>{
+    sessions=[];
+    currentSession=null;
+    blocks=[];
+    render();
+  };
+
+  if(!SR){
+    micBtn.disabled=true;
+    statusEl.textContent='此瀏覽器沒有 SpeechRecognition API';
+    render();
+    return;
+  }
+
+  rec=new SR();
+  rec.lang='zh-TW';
+  rec.continuous=true;
+  rec.interimResults=true;
+  rec.maxAlternatives=3;
+
+  rec.onstart=()=>{
+    currentSession={id:nextSessionId++,results:new Map()};
+    sessions.push(currentSession);
+    setRecState('listening');
+    statusEl.textContent='辨識中';
+    render();
+  };
+
+  rec.onresult=e=>{
+    if(!currentSession) return;
+
+    for(let i=0;i<e.results.length;i++){
+      const res=e.results[i];
+      currentSession.results.set(i,{
+        text:res[0].transcript,
+        isFinal:res.isFinal,
+        confidence:res[0].confidence
+      });
+    }
+    render();
+  };
+
+  rec.onerror=e=>{
+    statusEl.textContent=`錯誤：${e.error}`;
+    setRecState('idle');
+  };
+
+  rec.onend=()=>{
+    setRecState('idle');
+    statusEl.textContent='已停止';
+    currentSession=null;
+    render();
+  };
+
+  micBtn.onclick=()=>{
+    try{
+      if(recState==='idle'){
+        setRecState('starting');
+        statusEl.textContent='啟動中…';
+        rec.start();
+      }else if(recState==='listening'){
+        setRecState('stopping');
+        statusEl.textContent='停止中…';
+        rec.stop();
+      }
+    }catch(err){
+      statusEl.textContent=String(err);
+      setRecState('idle');
+    }
+  };
+
+  render();
+})();
+</script>
+</body>
+</html>
